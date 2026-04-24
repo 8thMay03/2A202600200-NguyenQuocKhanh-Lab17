@@ -104,3 +104,30 @@ pytest tests/ -v
 | 1 | High | Recent 3 turns | Last resort |
 | 2 | Medium | Retrieved memories | When needed |
 | 3 | Low | Old history, episodic logs | First to evict |
+
+## Conflict Handling
+
+Khi user đính chính một thông tin (ví dụ: dị ứng sữa bò → đậu nành), `RedisLongTermMemory` ghi đè entry cũ thay vì append:
+
+```python
+await redis_memory.store_preference("allergy", "dairy")   # lưu lần đầu
+await redis_memory.store_preference("allergy", "soy")     # ghi đè → không còn "dairy"
+```
+
+Nguyên lý: preference dùng **stable Redis key** `ltm:pref:<key>` thay vì UUID ngẫu nhiên, đảm bảo mỗi category chỉ có 1 giá trị mới nhất.
+
+## Reflection: Privacy & Limitations
+
+Xem chi tiết tại [`docs/REFLECTION.md`](docs/REFLECTION.md).
+
+Tóm tắt các điểm quan trọng:
+
+| Rủi ro / Giới hạn | Mức độ |
+|-------------------|--------|
+| Long-term Redis lưu PII (tên, dị ứng, lịch) — không có consent | 🔴 Cao |
+| Fakeredis không persist qua restart | 🔴 Cao |
+| Không có user isolation (multi-tenant) | 🔴 Cao |
+| Semantic search có thể retrieve false positive | 🟡 Trung bình |
+| JSONL episodic không concurrent-safe | 🟡 Trung bình |
+| LLM-based routing tốn thêm 1 API call/turn | 🟡 Trung bình |
+

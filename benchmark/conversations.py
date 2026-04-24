@@ -53,15 +53,19 @@ CONVERSATIONS: list[dict] = [
         ],
     },
     {
-        "id": "conv_05_emotional",
-        "name": "Emotional Context Tracking",
-        "description": "Tests if the agent picks up on and remembers emotional context",
+        "id": "conv_05_conflict_update",
+        "name": "Allergy Conflict Update",
+        "description": (
+            "Tests conflict handling: user states a preference/allergy fact, "
+            "then corrects it. The agent must store only the latest fact and "
+            "discard the contradictory old one."
+        ),
         "turns": [
-            "I'm really frustrated with this bug I've been debugging for 3 hours",
-            "It turns out it was just a missing semicolon...",
-            "I feel much better now. Thanks for listening!",
-            "How was I feeling at the start of our conversation?",
-            "Give me a motivational message based on our conversation",
+            "I am allergic to dairy milk — please remember this for any food recommendations",
+            "Actually wait, I was wrong. I am allergic to soy, not dairy milk.",
+            "What am I allergic to? Make sure you have the corrected information.",
+            "Suggest a high-protein breakfast for me given my allergy.",
+            "Also remember that I prefer vegetarian food. Now recommend a full day meal plan.",
         ],
     },
     {

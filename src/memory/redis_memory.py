@@ -2,6 +2,13 @@
 
 Uses fakeredis for local development so no external Redis server is required.
 Stores user preferences, facts, and long-term knowledge as key-value pairs.
+
+Conflict Handling:
+    User preferences are stored with a **deterministic key** derived from the
+    preference category (e.g., ``ltm:pref:allergy``).  When the user corrects
+    a fact, ``store_preference`` calls ``redis.set`` with the same key, which
+    **overwrites** the old value — preventing contradictory facts from
+    accumulating in the profile.
 """
 
 from __future__ import annotations
@@ -58,12 +65,29 @@ class RedisLongTermMemory(MemoryBackend):
         return MemoryEntry(**data)
 
     async def store(self, entry: MemoryEntry) -> None:
-        """Store entry in Redis."""
+        """Store entry in Redis.
+
+        If the entry carries a ``pref_key`` in its metadata the entry is
+        stored under a **stable** key (``ltm:pref:<pref_key>``) so that a
+        later write for the same preference automatically overwrites the
+        previous value — resolving conflicts without manual cleanup.
+        """
         entry.token_count = self._count_tokens(entry.content)
         entry.memory_type = MemoryType.LONG_TERM
-        self._redis.set(self._key(entry.id), self._serialize(entry))
-        # Maintain an index set of all entry IDs
-        self._redis.sadd(f"{self.NAMESPACE}:index", entry.id)
+
+        pref_key = entry.metadata.get("pref_key")
+        if pref_key:
+            # Use a deterministic stable key so updates overwrite old facts.
+            stable_id = f"pref_{pref_key}"
+            entry_id = stable_id
+            redis_key = f"{self.NAMESPACE}:pref:{pref_key}"
+        else:
+            entry_id = entry.id
+            redis_key = self._key(entry.id)
+
+        self._redis.set(redis_key, self._serialize(entry))
+        # Track both style of keys in the index
+        self._redis.sadd(f"{self.NAMESPACE}:index", entry_id)
 
     async def retrieve(self, query: str, top_k: int = 5) -> list[MemoryEntry]:
         """Simple keyword-match retrieval across stored entries.
@@ -89,7 +113,12 @@ class RedisLongTermMemory(MemoryBackend):
         """Remove all long-term memory entries."""
         ids = self._redis.smembers(f"{self.NAMESPACE}:index")
         for entry_id in ids:
-            self._redis.delete(self._key(entry_id))
+            # Support both stable pref keys and raw UUID keys
+            if entry_id.startswith("pref_"):
+                pref_name = entry_id[len("pref_"):]
+                self._redis.delete(f"{self.NAMESPACE}:pref:{pref_name}")
+            else:
+                self._redis.delete(self._key(entry_id))
         self._redis.delete(f"{self.NAMESPACE}:index")
 
     async def get_all(self) -> list[MemoryEntry]:
@@ -97,14 +126,30 @@ class RedisLongTermMemory(MemoryBackend):
         ids = self._redis.smembers(f"{self.NAMESPACE}:index")
         entries: list[MemoryEntry] = []
         for entry_id in ids:
-            raw = self._redis.get(self._key(entry_id))
+            if entry_id.startswith("pref_"):
+                pref_name = entry_id[len("pref_"):]
+                raw = self._redis.get(f"{self.NAMESPACE}:pref:{pref_name}")
+            else:
+                raw = self._redis.get(self._key(entry_id))
             if raw:
                 entries.append(self._deserialize(raw))
         entries.sort(key=lambda e: e.timestamp)
         return entries
 
     async def store_preference(self, key: str, value: str) -> None:
-        """Convenience: store a user preference."""
+        """Store (or overwrite) a user preference fact.
+
+        Because ``store()`` uses a stable Redis key for preference entries
+        (``ltm:pref:<key>``), calling this method a second time with the
+        same ``key`` **replaces** the old value.  This is the primary
+        mechanism for conflict resolution:
+
+        Example::
+
+            await mem.store_preference("allergy", "dairy")
+            # User corrects themselves:
+            await mem.store_preference("allergy", "soy")   # overwrites dairy
+        """
         entry = MemoryEntry(
             content=f"User preference — {key}: {value}",
             memory_type=MemoryType.LONG_TERM,
@@ -114,7 +159,7 @@ class RedisLongTermMemory(MemoryBackend):
         await self.store(entry)
 
     async def get_preferences(self) -> dict[str, str]:
-        """Retrieve all stored user preferences."""
+        """Retrieve all stored user preferences (most-recent wins)."""
         all_entries = await self.get_all()
         prefs: dict[str, str] = {}
         for e in all_entries:

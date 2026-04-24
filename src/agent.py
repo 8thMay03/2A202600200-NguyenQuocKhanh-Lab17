@@ -6,6 +6,7 @@ memory routing, and context window management.
 
 from __future__ import annotations
 import operator
+import re
 from typing import Annotated, Any, TypedDict
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -131,13 +132,60 @@ class MultiMemoryAgent:
         return {"turn_count": self._turn_count}
 
     async def _detect_and_store_preferences(self, query: str, response: str):
-        pref_indicators = ["i prefer", "i like", "my favorite", "i always", "i want", "call me", "my name is", "i use", "i hate"]
+        """Detect user preferences/facts and store them with conflict resolution.
+
+        Uses a two-step approach:
+        1. Keyword scan to identify *which* preference category is mentioned.
+        2. Store via ``redis_memory.store_preference(key, value)`` which writes
+           to a **stable Redis key** so a later correction overwrites the old
+           fact instead of accumulating contradictory entries.
+        """
         q_lower = query.lower()
-        if any(ind in q_lower for ind in pref_indicators):
-            await self.redis_memory.store(MemoryEntry(
-                content=f"User stated: {query}", memory_type=MemoryType.LONG_TERM,
-                metadata={"category": "preference", "source_query": query}, priority=1,
-            ))
+
+        # ── Extraction rules (key, pattern to capture the value) ─────────────
+        RULES: list[tuple[str, list[str]]] = [
+            ("name",     [r"(?:my name is|call me)\s+([\w]+)",
+                          r"i(?:'m| am)\s+([\w]+)",]),
+            ("language", [r"(?:prefer|use|like)\s+([\w+#]+)(?:\s+(?:over|for|as)\b)?",]),
+            ("allergy",  [r"(?:allergic to|allergy(?:\s+to)?)\s+([\w\s]+?)(?:\.|,|$)",
+                          r"(?:i\s+)?(?:am\s+)?(?:not\s+)?allergic\s+to\s+([\w\s]+?)(?:\.|,|$)",]),
+            ("editor",   [r"(?:use|prefer)\s+([\w\s]+?)(?:\s+(?:editor|ide|mode))",]),
+            ("theme",    [r"(?:dark mode|light mode)",]),
+            ("timezone", [r"(?:timezone is|gmt[+-][\d]+|utc[+-][\d]+)",]),
+            ("schedule", [r"work from\s+[\d:apm\s]+to\s+[\d:apm\s]+",]),
+            ("role",     [r"(?:i(?:'m| am) a|my job is|i work as)\s+([\w\s]+?)(?:\.|,|$)",]),
+        ]
+
+        pref_indicators = [
+            "i prefer", "i like", "my favorite", "i always", "i want",
+            "call me", "my name is", "i use", "i hate", "i am a", "i'm a",
+            "allergic", "allergy", "dark mode", "light mode",
+            "timezone is", "work from", "my job", "i work as",
+        ]
+        if not any(ind in q_lower for ind in pref_indicators):
+            return
+
+        stored_any = False
+        for pref_key, patterns in RULES:
+            for pattern in patterns:
+                m = re.search(pattern, q_lower)
+                if m:
+                    value = m.group(1).strip() if m.lastindex else m.group(0).strip()
+                    if value:
+                        await self.redis_memory.store_preference(pref_key, value)
+                        stored_any = True
+                        break  # only one value per key per message
+
+        # Fallback: store the raw query as a general preference
+        if not stored_any:
+            await self.redis_memory.store(
+                MemoryEntry(
+                    content=f"User stated: {query}",
+                    memory_type=MemoryType.LONG_TERM,
+                    metadata={"category": "preference", "source_query": query},
+                    priority=1,
+                )
+            )
 
     def _extract_topic(self, query: str) -> str:
         words = query.lower().split()

@@ -101,23 +101,81 @@ class ContextWindowManager:
         return state
 
     def format_context_for_llm(self, state: ContextWindowState) -> list[dict[str, str]]:
+        """Format context blocks into LLM messages with clear memory sections.
+
+        Memory entries are grouped into labelled sections injected as a
+        system-level context block so the LLM can distinguish between:
+        - [Profile / Long-term]  — persistent user facts & preferences
+        - [Episodic / Past]      — past conversation experiences
+        - [Semantic / Knowledge] — retrieved similar knowledge chunks
+        - [Recent Conversation]  — last N turns (short-term buffer)
+        """
         messages: list[dict[str, str]] = []
+
+        # 1. System prompt (critical, never evicted)
+        system_text = ""
         for block in state.blocks:
             if block.source == "system_prompt":
-                messages.append({"role": "system", "content": block.content})
-            elif block.source == "current_query":
+                system_text = block.content
+                break
+        if system_text:
+            messages.append({"role": "system", "content": system_text})
+
+        # 2. Collect memory entries grouped by type
+        profile_lines: list[str] = []
+        episodic_lines: list[str] = []
+        semantic_lines: list[str] = []
+        for block in state.blocks:
+            if not block.source.startswith("memory_"):
                 continue
-            elif block.source in ("recent_turn", "older_turn"):
-                if block.content.startswith("user:"):
-                    messages.append({"role": "user", "content": block.content[5:].strip()})
-                elif block.content.startswith("assistant:"):
-                    messages.append({"role": "assistant", "content": block.content[10:].strip()})
-            elif block.source.startswith("memory_"):
-                messages.append({"role": "system", "content": f"[Retrieved Memory ({block.source})]: {block.content}"})
+            mem_type = block.source[len("memory_"):]
+            if mem_type == "long_term":
+                profile_lines.append(f"  - {block.content}")
+            elif mem_type == "episodic":
+                episodic_lines.append(f"  - {block.content}")
+            elif mem_type == "semantic":
+                semantic_lines.append(f"  - {block.content}")
+            else:  # short_term retrieved via router
+                profile_lines.append(f"  - {block.content}")
+
+        # 3. Build a single structured memory context system message
+        memory_sections: list[str] = []
+        if profile_lines:
+            memory_sections.append(
+                "[Profile / Long-term Memory]\n" + "\n".join(profile_lines)
+            )
+        if episodic_lines:
+            memory_sections.append(
+                "[Episodic / Past Experiences]\n" + "\n".join(episodic_lines)
+            )
+        if semantic_lines:
+            memory_sections.append(
+                "[Semantic / Knowledge Base]\n" + "\n".join(semantic_lines)
+            )
+        if memory_sections:
+            messages.append({
+                "role": "system",
+                "content": "=== Retrieved Memory Context ===\n" + "\n\n".join(memory_sections),
+            })
+
+        # 4. Conversation history (older_turn first, then recent_turn)
+        for block in state.blocks:
+            if block.source not in ("recent_turn", "older_turn"):
+                continue
+            role = "user" if block.content.lower().startswith("user:") else "assistant"
+            raw = block.content
+            if role == "user" and raw.lower().startswith("user:"):
+                raw = raw[5:].strip()
+            elif role == "assistant" and raw.lower().startswith("assistant:"):
+                raw = raw[10:].strip()
+            messages.append({"role": role, "content": raw})
+
+        # 5. Current user query (always last)
         for block in state.blocks:
             if block.source == "current_query":
                 messages.append({"role": "user", "content": block.content})
                 break
+
         return messages
 
     def get_utilization(self, state: ContextWindowState) -> dict:
